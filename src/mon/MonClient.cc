@@ -11,6 +11,7 @@
  * Foundation.  See file COPYING.
  * 
  */
+#include <pthread.h>
 
 #include "messages/MMonGetMap.h"
 #include "messages/MMonGetVersion.h"
@@ -36,10 +37,24 @@
 #include "auth/AuthMethodList.h"
 #include "auth/RotatingKeyRing.h"
 
+#include "include/atomic.h"
+
 
 #define dout_subsys ceph_subsys_monc
 #undef dout_prefix
 #define dout_prefix *_dout << "monclient" << (hunting ? "(hunting)":"") << ": "
+
+typedef struct {
+  std::string *mon;
+  std::string *cur_mon;
+  entity_inst_t *inst;
+  ConnectionRef *con;
+  ConnectionRef *cur_con;
+  Messenger *msgr;
+  MonMap *map_ptr;
+  pthread_mutex_t *hunt_mutex;
+  atomic_spinlock_t<bool> *atom;
+} mon_thread_dat;
 
 MonClient::MonClient(CephContext *cct_) :
   Dispatcher(cct_),
@@ -101,6 +116,40 @@ int MonClient::get_monmap()
   return 0;
 }
 
+static void *hunt_mon(void *hunt_dat) {
+  mon_thread_dat *dat = (mon_thread_dat *)hunt_dat;
+
+  if (dat->atom->read()) {
+    return nullptr; //parallel search is over
+  }
+
+  ConnectionRef con = dat->msgr->get_connection(*dat->inst);
+  if (con) {
+    //if there is a connection, send message
+    con->send_message(new MMonGetMap);
+    
+    pthread_mutex_lock(dat->hunt_mutex);
+    *(dat->cur_con) = con;
+    *(dat->cur_mon) = *(dat->mon);
+
+    if (dat->map_ptr->fsid.is_zero()) {
+      con->mark_down();
+    }
+  } else {  
+    pthread_mutex_lock(dat->hunt_mutex);
+  }
+  
+  //in any case, check hunt exit case
+  bool fsid_zero = dat->map_ptr->fsid.is_zero();
+  pthread_mutex_unlock(dat->hunt_mutex);
+  
+  if (!fsid_zero) {
+    dat->atom->compare_and_swap(false, true); //end parallel search
+  }
+  
+  return nullptr;
+}
+
 int MonClient::get_monmap_privately()
 {
   ldout(cct, 10) << "get_monmap_privately" << dendl;
@@ -122,25 +171,41 @@ int MonClient::get_monmap_privately()
 
   ldout(cct, 10) << "have " << monmap.epoch << " fsid " << monmap.fsid << dendl;
 
-  while (monmap.fsid.is_zero()) {
-    cur_mon = _pick_random_mon();
-    cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
-    if (cur_con) {
-      ldout(cct, 10) << "querying mon." << cur_mon << " "
-		     << cur_con->get_peer_addr() << dendl;
-      cur_con->send_message(new MMonGetMap);
-    }
+  mon_thread_dat data[attempt];
+  pthread_mutex_t hunt_mutex;
+  atomic_spinlock_t<bool> atom (false);
+  mon_thread_dat *dat;
+  int j;
+  for (j = 0; j < attempt; j++) {
+    dat = &data[j];
+    
+    std::string mon = _pick_random_mon();
+    dat->mon = &mon;
+    dat->cur_mon = &cur_mon;
+    entity_inst_t inst = monmap.get_inst(mon);
+    dat->inst = &inst;
+    
+    dat->cur_con = &cur_con;
+    dat->msgr = Messenger::create_client_messenger(cct, "temp_mon_client");
+    dat->msgr->add_dispatcher_head(this);
+    dat->msgr->start();
+    dat->map_ptr = &monmap;
+    dat->hunt_mutex = &hunt_mutex;
+    dat->atom = &atom;
+  }
 
-    if (--attempt == 0)
-      break;
+  pthread_t threads[attempt];
+  j = 0;
+  while (j < attempt) {
+    dat = &data[j];
 
-    utime_t interval;
-    interval.set_from_double(cct->_conf->mon_client_hunt_interval);
-    map_cond.WaitInterval(cct, monc_lock, interval);
+    pthread_create(&threads[j], nullptr, &hunt_mon, (void *)dat);
+    j++;
+    //utime_t interval; //interval.set_from_double(cct->_conf->mon_client_hunt_interval); //map_cond.WaitInterval(cct, monc_lock, interval); 
+  }
 
-    if (monmap.fsid.is_zero() && cur_con) {
-      cur_con->mark_down();  // nope, clean that connection up
-    }
+  for (j = 0; j < attempt; j++) {
+    pthread_join(threads[j], nullptr);
   }
 
   if (temp_msgr) {
