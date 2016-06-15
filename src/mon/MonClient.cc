@@ -45,9 +45,9 @@
 #define dout_prefix *_dout << "monclient" << (hunting ? "(hunting)":"") << ": "
 
 typedef struct {
-  std::string *mon;
+  std::string mon;
   std::string *cur_mon;
-  entity_inst_t *inst;
+  entity_inst_t inst;
   ConnectionRef *con;
   ConnectionRef *cur_con;
   Messenger *msgr;
@@ -123,21 +123,22 @@ static void *hunt_mon(void *hunt_dat) {
     return nullptr; //parallel search is over
   }
 
-  ConnectionRef con = dat->msgr->get_connection(*dat->inst);
+  pthread_mutex_lock(dat->hunt_mutex);
+  ConnectionRef con = dat->msgr->get_connection(dat->inst);
   if (con) {
     //if there is a connection, send message
     con->send_message(new MMonGetMap);
     
-    pthread_mutex_lock(dat->hunt_mutex);
+    //pthread_mutex_lock(dat->hunt_mutex);
     *(dat->cur_con) = con;
-    *(dat->cur_mon) = *(dat->mon);
+    *(dat->cur_mon) = dat->mon;
 
     if (dat->map_ptr->fsid.is_zero()) {
       con->mark_down();
     }
-  } else {  
-    pthread_mutex_lock(dat->hunt_mutex);
-  }
+  }// else {  
+    //pthread_mutex_lock(dat->hunt_mutex);
+  //}
   
   //in any case, check hunt exit case
   bool fsid_zero = dat->map_ptr->fsid.is_zero();
@@ -179,20 +180,20 @@ int MonClient::get_monmap_privately()
   for (j = 0; j < attempt; j++) {
     dat = &data[j];
     
-    std::string mon = _pick_random_mon();
-    dat->mon = &mon;
+    dat->mon = _pick_random_mon();
     dat->cur_mon = &cur_mon;
-    entity_inst_t inst = monmap.get_inst(mon);
-    dat->inst = &inst;
+    dat->inst = monmap.get_inst(dat->mon);
     
     dat->cur_con = &cur_con;
-    dat->msgr = Messenger::create_client_messenger(cct, "temp_mon_client");
-    dat->msgr->add_dispatcher_head(this);
-    dat->msgr->start();
+    dat->msgr = messenger; //Messenger::create_client_messenger(cct, "hunt_mon_client" + std::to_string(j));
+    //dat->msgr->add_dispatcher_head(this);
+    //dat->msgr->start();
     dat->map_ptr = &monmap;
     dat->hunt_mutex = &hunt_mutex;
     dat->atom = &atom;
   }
+
+  ldout(cct, 10) << "thread data initialized" << dendl;
 
   pthread_t threads[attempt];
   j = 0;
@@ -207,6 +208,8 @@ int MonClient::get_monmap_privately()
   for (j = 0; j < attempt; j++) {
     pthread_join(threads[j], nullptr);
   }
+
+  ldout(cct, 10) << "parallel hunt over" << dendl;
 
   if (temp_msgr) {
     if (cur_con) {
