@@ -54,6 +54,10 @@ typedef struct {
   MonMap *map_ptr;
   pthread_mutex_t *hunt_mutex;
   atomic_spinlock_t<bool> *atom;
+  //extra stuff
+  CephContext *cct;
+  Cond *map_cond;
+  Mutex *monc_lock;
 } mon_thread_dat;
 
 MonClient::MonClient(CephContext *cct_) :
@@ -122,27 +126,25 @@ static void *hunt_mon(void *hunt_dat) {
   if (dat->atom->read()) {
     return nullptr; //parallel search is over
   }
-
+  
   pthread_mutex_lock(dat->hunt_mutex);
   ConnectionRef con = dat->msgr->get_connection(dat->inst);
   if (con) {
-    //if there is a connection, send message
     con->send_message(new MMonGetMap);
     
-    //pthread_mutex_lock(dat->hunt_mutex);
     *(dat->cur_con) = con;
     *(dat->cur_mon) = dat->mon;
-
-    if (dat->map_ptr->fsid.is_zero()) {
-      con->mark_down();
-    }
-  }// else {  
-    //pthread_mutex_lock(dat->hunt_mutex);
-  //}
+  }
   
-  //in any case, check hunt exit case
+  utime_t interval;
+  interval.set_from_double(dat->cct->_conf->mon_client_hunt_interval);
+  dat->map_cond->WaitInterval(dat->cct, *dat->monc_lock, interval);
+  
   bool fsid_zero = dat->map_ptr->fsid.is_zero();
-  pthread_mutex_unlock(dat->hunt_mutex);
+  if (fsid_zero && con) {
+    con->mark_down();
+  } 
+  pthread_mutex_unlock(dat->hunt_mutex);  
   
   if (!fsid_zero) {
     dat->atom->compare_and_swap(false, true); //end parallel search
@@ -191,6 +193,11 @@ int MonClient::get_monmap_privately()
     dat->map_ptr = &monmap;
     dat->hunt_mutex = &hunt_mutex;
     dat->atom = &atom;
+
+    //extra stuff
+    dat->cct = cct;
+    dat->map_cond = &map_cond;
+    dat->monc_lock = &monc_lock;
   }
 
   ldout(cct, 10) << "thread data initialized" << dendl;
