@@ -46,11 +46,11 @@
 
 typedef struct {
   MonClient *mon_context;
-  std::string mon [10];
-  entity_inst_t inst [10];
   pthread_mutex_t *hunt_mutex;
   atomic_spinlock_t<bool> *atom;
   int chunk_size;
+  std::string mon [10];
+  entity_inst_t inst [10];
 } mon_thread_dat;
 
 MonClient::MonClient(CephContext *cct_) :
@@ -114,29 +114,36 @@ int MonClient::get_monmap()
 }
 
 void *MonClient::hunt_mon_entry(void *hunt_dat) {
-  return ((MonClient *)(((mon_thread_dat *)hunt_dat)->mon_context))->hunt_mon(hunt_dat);
+  mon_thread_dat *dat = (mon_thread_dat *)hunt_dat;
+  MonClient *ctx = dat->mon_context;
+  return ctx->hunt_mon(hunt_dat);
 }
 
 void *MonClient::hunt_mon(void *hunt_dat) {
   mon_thread_dat *dat = (mon_thread_dat *)hunt_dat;
   
-  int COMPILER_WARNING;
-  if (dat->atom->read()) {
+  /*if (dat->atom->read()) {
     return nullptr; //parallel search is over
-  }
-  pthread_mutex_lock(dat->hunt_mutex);
-  
+  }*/
+  //pthread_mutex_lock(dat->hunt_mutex);  
+
+  ldout(cct, 10) << "(par) starting hunt" << dendl;
   int j = 0;
-  while (j < dat->chunk_size) {
+  int attempt = dat->chunk_size;
+  while (monmap.fsid.is_zero()) {
     ConnectionRef con = messenger->get_connection(dat->inst[j]);
+    ldout(cct, 10) << "(par) checking mon: " << dat->mon[j] << dendl;
+
     if (con) {
       con->send_message(new MMonGetMap);
       
       cur_con = con; //shared resource
       cur_mon = dat->mon[j]; //shared resource
     }
+    
+    ++j;
 
-    if (++j == dat->chunk_size)
+    if (--attempt == 0)
       break;
 
     utime_t interval;
@@ -147,13 +154,18 @@ void *MonClient::hunt_mon(void *hunt_dat) {
 
     if (fsid_zero && con) {
       //shared resource
-      cur_con->mark_down();  // nope, clean that connection up
-    } else if (!fsid_zero) {
-      dat->atom->compare_and_swap(false, true);
+      con->mark_down();  // nope, clean that connection up
+    } //else if (!fsid_zero) {
+      //dat->atom->compare_and_swap(false, true);
+      //break;
+    //}
+
+    if (j == dat->chunk_size) {
       break;
     }
   }
-  pthread_mutex_unlock(dat->hunt_mutex);
+  ldout(cct, 10) << "(par) ending hunt" << dendl;
+  //pthread_mutex_unlock(dat->hunt_mutex);
     
   return nullptr;
 }
@@ -179,6 +191,7 @@ int MonClient::get_monmap_privately()
   int num_cores = 1;
   int chunk_size = 10; //(attempt % num_cores == 0) ? (attempt / num_cores) : (attempt / num_cores) + 1;
 
+  ldout(cct, 10) << "cores: " << num_cores << "; chunks: " << chunk_size << dendl;
   ldout(cct, 10) << "have " << monmap.epoch << " fsid " << monmap.fsid << dendl;
 
   mon_thread_dat data[num_cores];
@@ -205,7 +218,7 @@ int MonClient::get_monmap_privately()
   j = 0;
   while (j < num_cores) {
     dat = &data[j];
-
+    ldout(cct, 10) << "spawning thread" << dendl;
     pthread_create(&threads[j], nullptr, &hunt_mon_entry, (void  *)dat);
     j++; 
   }
