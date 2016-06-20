@@ -395,7 +395,7 @@ int mirror_image_disable_internal(ImageCtx *ictx, bool force,
 
   if (remove) {
     r = cls_client::mirror_image_remove(&ictx->md_ctx, ictx->id);
-    if (r < 0) {
+    if (r < 0 && r != -ENOENT) {
       lderr(cct) << "failed to remove image from mirroring directory: "
                  << cpp_strerror(r) << dendl;
       return r;
@@ -1827,7 +1827,7 @@ int mirror_image_disable_internal(ImageCtx *ictx, bool force,
             }
           } else if (mirror_mode == RBD_MIRROR_MODE_POOL) {
             r = cls_client::mirror_image_remove(&ictx->md_ctx, ictx->id);
-            if (r < 0) {
+            if (r < 0 && r != -ENOENT) {
               lderr(cct) << "failed to remove image from mirroring directory: "
                          << cpp_strerror(r) << dendl;
               return r;
@@ -2217,6 +2217,17 @@ int mirror_image_disable_internal(ImageCtx *ictx, bool force,
     RWLock::RLocker l(ictx->snap_lock);
     *exists = ictx->get_snap_id(snap_name) != CEPH_NOSNAP; 
     return 0;
+  }
+
+  int snap_get_limit(ImageCtx *ictx, uint64_t *limit)
+  {
+    return cls_client::snapshot_get_limit(&ictx->md_ctx, ictx->header_oid,
+					  limit);
+  }
+
+  int snap_set_limit(ImageCtx *ictx, uint64_t limit)
+  {
+    return ictx->operations->snap_set_limit(limit);
   }
 
   struct CopyProgressCtx {
@@ -3598,5 +3609,109 @@ int mirror_image_disable_internal(ImageCtx *ictx, bool force,
       ictx->perfcounter->inc(l_librbd_readahead);
       ictx->perfcounter->inc(l_librbd_readahead_bytes, readahead_length);
     }
+  }
+
+  // Consistency groups functions
+
+  int group_create(librados::IoCtx& io_ctx, const char *group_name)
+  {
+    CephContext *cct = (CephContext *)io_ctx.cct();
+
+    Rados rados(io_ctx);
+    uint64_t bid = rados.get_instance_id();
+
+    uint32_t extra = rand() % 0xFFFFFFFF;
+    ostringstream bid_ss;
+    bid_ss << std::hex << bid << std::hex << extra;
+    string id = bid_ss.str();
+
+    ldout(cct, 2) << "adding consistency group to directory..." << dendl;
+
+    int r = cls_client::group_dir_add(&io_ctx, RBD_GROUP_DIRECTORY, group_name, id);
+    if (r < 0) {
+      lderr(cct) << "error adding consistency group to directory: "
+		 << cpp_strerror(r)
+		 << dendl;
+      return r;
+    }
+    string header_oid = util::group_header_name(id);
+
+    r = cls_client::group_create(&io_ctx, header_oid);
+    if (r < 0) {
+      lderr(cct) << "error writing header: " << cpp_strerror(r) << dendl;
+      goto err_remove_from_dir;
+    }
+
+    return 0;
+
+  err_remove_from_dir:
+    int remove_r = cls_client::group_dir_remove(&io_ctx, RBD_GROUP_DIRECTORY,
+						group_name, id);
+    if (remove_r < 0) {
+      lderr(cct) << "error cleaning up consistency group from rbd_directory "
+		 << "object after creation failed: " << cpp_strerror(remove_r)
+		 << dendl;
+    }
+
+    return r;
+  }
+
+  int group_remove(librados::IoCtx& io_ctx, const char *group_name)
+  {
+    CephContext *cct((CephContext *)io_ctx.cct());
+    ldout(cct, 20) << "group_remove " << &io_ctx << " " << group_name << dendl;
+
+    std::string group_id;
+    int r = cls_client::dir_get_id(&io_ctx, RBD_GROUP_DIRECTORY,
+	                       std::string(group_name), &group_id);
+    if (r < 0 && r != -ENOENT) {
+      lderr(cct) << "error getting id of group" << dendl;
+      return r;
+    }
+
+    string header_oid = util::group_header_name(group_id);
+
+    r = io_ctx.remove(header_oid);
+    if (r < 0 && r != -ENOENT) {
+      lderr(cct) << "error removing header: " << cpp_strerror(-r) << dendl;
+      return r;
+    }
+
+    r = cls_client::group_dir_remove(&io_ctx, RBD_GROUP_DIRECTORY,
+					 group_name, group_id);
+    if (r < 0 && r != -ENOENT) {
+      lderr(cct) << "error removing group from directory" << dendl;
+      return r;
+    }
+
+    return 0;
+  }
+
+  int group_list(IoCtx& io_ctx, vector<string>& names)
+  {
+    CephContext *cct = (CephContext *)io_ctx.cct();
+    ldout(cct, 20) << "group_list " << &io_ctx << dendl;
+
+    int max_read = 1024;
+    string last_read = "";
+    int r;
+    do {
+      map<string, string> groups;
+      r = cls_client::group_dir_list(&io_ctx, RBD_GROUP_DIRECTORY, last_read, max_read, &groups);
+      if (r < 0) {
+        lderr(cct) << "error listing group in directory: "
+                   << cpp_strerror(r) << dendl;
+        return r;
+      }
+      for (pair<string, string> group : groups) {
+	names.push_back(group.first);
+      }
+      if (!groups.empty()) {
+	last_read = groups.rbegin()->first;
+      }
+      r = groups.size();
+    } while (r == max_read);
+
+    return 0;
   }
 }
