@@ -141,6 +141,8 @@ private:
   bool ms_handle_reset(Connection *con);
   void ms_handle_remote_reset(Connection *con) {}
 
+  static void *hunt_mon_entry(void *hunt_dat);
+
   void handle_monmap(MMonMap *m);
 
   void handle_auth(MAuthReply *m);
@@ -167,6 +169,9 @@ private:
   uint32_t want_keys;
 
   uint64_t global_id;
+
+protected:
+  void *hunt_mon(void *hunt_dat);
 
   // authenticate
 private:

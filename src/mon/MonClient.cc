@@ -45,19 +45,12 @@
 #define dout_prefix *_dout << "monclient" << (hunting ? "(hunting)":"") << ": "
 
 typedef struct {
-  std::string mon;
-  std::string *cur_mon;
-  entity_inst_t inst;
-  ConnectionRef *con;
-  ConnectionRef *cur_con;
-  Messenger *msgr;
-  MonMap *map_ptr;
+  MonClient *mon_context;
+  std::string mon [10];
+  entity_inst_t inst [10];
   pthread_mutex_t *hunt_mutex;
   atomic_spinlock_t<bool> *atom;
-  //extra stuff
-  CephContext *cct;
-  Cond *map_cond;
-  Mutex *monc_lock;
+  int chunk_size;
 } mon_thread_dat;
 
 MonClient::MonClient(CephContext *cct_) :
@@ -120,36 +113,48 @@ int MonClient::get_monmap()
   return 0;
 }
 
-static void *hunt_mon(void *hunt_dat) {
-  mon_thread_dat *dat = (mon_thread_dat *)hunt_dat;
+void *MonClient::hunt_mon_entry(void *hunt_dat) {
+  return ((MonClient *)(((mon_thread_dat *)hunt_dat)->mon_context))->hunt_mon(hunt_dat);
+}
 
+void *MonClient::hunt_mon(void *hunt_dat) {
+  mon_thread_dat *dat = (mon_thread_dat *)hunt_dat;
+  
+  int COMPILER_WARNING;
   if (dat->atom->read()) {
     return nullptr; //parallel search is over
   }
-  
   pthread_mutex_lock(dat->hunt_mutex);
-  ConnectionRef con = dat->msgr->get_connection(dat->inst);
-  if (con) {
-    con->send_message(new MMonGetMap);
+  
+  int j = 0;
+  while (j < dat->chunk_size) {
+    ConnectionRef con = messenger->get_connection(dat->inst[j]);
+    if (con) {
+      con->send_message(new MMonGetMap);
+      
+      cur_con = con; //shared resource
+      cur_mon = dat->mon[j]; //shared resource
+    }
+
+    if (++j == dat->chunk_size)
+      break;
+
+    utime_t interval;
+    interval.set_from_double(cct->_conf->mon_client_hunt_interval); //maybe shared resource
+    map_cond.WaitInterval(cct, monc_lock, interval);
+
+    bool fsid_zero = monmap.fsid.is_zero(); //shared resource
+
+    if (fsid_zero && con) {
+      //shared resource
+      cur_con->mark_down();  // nope, clean that connection up
+    } else if (!fsid_zero) {
+      dat->atom->compare_and_swap(false, true);
+      break;
+    }
+  }
+  pthread_mutex_unlock(dat->hunt_mutex);
     
-    *(dat->cur_con) = con;
-    *(dat->cur_mon) = dat->mon;
-  }
-  
-  utime_t interval;
-  interval.set_from_double(dat->cct->_conf->mon_client_hunt_interval);
-  dat->map_cond->WaitInterval(dat->cct, *dat->monc_lock, interval);
-  
-  bool fsid_zero = dat->map_ptr->fsid.is_zero();
-  if (fsid_zero && con) {
-    con->mark_down();
-  } 
-  pthread_mutex_unlock(dat->hunt_mutex);  
-  
-  if (!fsid_zero) {
-    dat->atom->compare_and_swap(false, true); //end parallel search
-  }
-  
   return nullptr;
 }
 
@@ -171,48 +176,41 @@ int MonClient::get_monmap_privately()
   }
 
   int attempt = 10;
+  int num_cores = 1;
+  int chunk_size = 10; //(attempt % num_cores == 0) ? (attempt / num_cores) : (attempt / num_cores) + 1;
 
   ldout(cct, 10) << "have " << monmap.epoch << " fsid " << monmap.fsid << dendl;
 
-  mon_thread_dat data[attempt];
+  mon_thread_dat data[num_cores];
   pthread_mutex_t hunt_mutex;
   atomic_spinlock_t<bool> atom (false);
   mon_thread_dat *dat;
   int j;
-  for (j = 0; j < attempt; j++) {
+  for (j = 0; j < num_cores; j++) {
     dat = &data[j];
+    dat->chunk_size = chunk_size;
+    dat->mon_context = this;
     
-    dat->mon = _pick_random_mon();
-    dat->cur_mon = &cur_mon;
-    dat->inst = monmap.get_inst(dat->mon);
-    
-    dat->cur_con = &cur_con;
-    dat->msgr = messenger; //Messenger::create_client_messenger(cct, "hunt_mon_client" + std::to_string(j));
-    //dat->msgr->add_dispatcher_head(this);
-    //dat->msgr->start();
-    dat->map_ptr = &monmap;
+    for (int k = 0; k < chunk_size; k++) {
+      dat->mon[k] = _pick_random_mon();    
+      dat->inst[k] = monmap.get_inst(dat->mon[k]);
+    }
     dat->hunt_mutex = &hunt_mutex;
     dat->atom = &atom;
-
-    //extra stuff
-    dat->cct = cct;
-    dat->map_cond = &map_cond;
-    dat->monc_lock = &monc_lock;
   }
 
   ldout(cct, 10) << "thread data initialized" << dendl;
 
-  pthread_t threads[attempt];
+  pthread_t threads[1];
   j = 0;
-  while (j < attempt) {
+  while (j < num_cores) {
     dat = &data[j];
 
-    pthread_create(&threads[j], nullptr, &hunt_mon, (void *)dat);
-    j++;
-    //utime_t interval; //interval.set_from_double(cct->_conf->mon_client_hunt_interval); //map_cond.WaitInterval(cct, monc_lock, interval); 
+    pthread_create(&threads[j], nullptr, &hunt_mon_entry, (void  *)dat);
+    j++; 
   }
 
-  for (j = 0; j < attempt; j++) {
+  for (j = 0; j < num_cores; j++) {
     pthread_join(threads[j], nullptr);
   }
 
