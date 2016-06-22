@@ -118,30 +118,29 @@ int MonClient::get_monmap_privately()
     temp_msgr = true;
   }
 
-  int attempt = 10;
+  int attempt = 20;
 
   ldout(cct, 10) << "have " << monmap.epoch << " fsid " << monmap.fsid << dendl;
 
-  while (monmap.fsid.is_zero()) {
-    cur_mon = _pick_random_mon();
-    cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
+  vector<string> mon;
+  for (int j = 0; j < attempt; j++) {
+    mon.push_back(_pick_random_mon());
+  }
+
+  vector<ConnectionRef> con;
+  for (auto j = mon.begin(); j != mon.end(); ++j) {
+    ConnectionRef mon_con = messenger->get_connection(monmap.get_inst(*j));
+    con.push_back(mon_con);
     if (cur_con) {
-      ldout(cct, 10) << "querying mon." << cur_mon << " "
+      ldout(cct, 10) << "querying mon." << *j << " "
 		     << cur_con->get_peer_addr() << dendl;
       cur_con->send_message(new MMonGetMap);
     }
-
-    if (--attempt == 0)
-      break;
-
-    utime_t interval;
-    interval.set_from_double(cct->_conf->mon_client_hunt_interval);
-    map_cond.WaitInterval(cct, monc_lock, interval);
-
-    if (monmap.fsid.is_zero() && cur_con) {
-      cur_con->mark_down();  // nope, clean that connection up
-    }
   }
+
+  utime_t interval;
+  interval.set_from_double(cct->_conf->mon_client_hunt_interval);
+  map_cond.WaitInterval(cct, monc_lock, interval);
 
   if (temp_msgr) {
     if (cur_con) {
